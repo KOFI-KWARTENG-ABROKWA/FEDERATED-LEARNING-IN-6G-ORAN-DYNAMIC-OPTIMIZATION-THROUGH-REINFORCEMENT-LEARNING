@@ -1,0 +1,627 @@
+import os
+import gym
+import numpy as np
+import random
+import torch
+import torch.nn as nn
+import torch.optim as optim
+import matplotlib.pyplot as plt
+from google.colab import drive
+drive.mount('/content/drive')
+from collections import deque
+
+# Efficiently convert a list of numpy arrays to a tensor
+def convert_list_to_tensor(list_of_arrays, dtype=torch.float32):
+    tensor = torch.tensor(np.array(list_of_arrays), dtype=dtype)
+    print(f"Converted tensor shape: {tensor.shape}")
+    return tensor
+
+class DDQN(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super(DDQN, self).__init__()
+        self.fc1 = nn.Linear(state_dim, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.fc3 = nn.Linear(128, action_dim)
+        self.optimizer = optim.Adam(self.parameters(), lr=0.001)
+        self.criterion = nn.MSELoss()
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        x = self.fc3(x)
+        return x
+
+class ReplayBuffer:
+    def __init__(self, capacity):
+        self.buffer = deque(maxlen=capacity)
+    
+    def push(self, transition):
+        self.buffer.append(transition)
+    
+    def sample(self, batch_size):
+        batch = random.sample(self.buffer, batch_size)
+        state, action, reward, next_state, done = zip(*batch)
+        return np.array(state), np.array(action), np.array(reward), np.array(next_state), np.array(done)
+
+    def __len__(self):
+        return len(self.buffer)
+
+class DDQNAgent:
+    def __init__(self, state_dim, action_dim):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.policy_net = DDQN(state_dim, action_dim)
+        self.target_net = DDQN(state_dim, action_dim)
+        self.target_net.load_state_dict(self.policy_net.state_dict())
+        self.target_net.eval()
+        self.optimizer = optim.Adam(self.policy_net.parameters(), lr=0.001)
+        self.replay_buffer = ReplayBuffer(10000)
+        self.batch_size = 128
+        self.gamma = 0.99
+        self.epsilon = 0.1
+        self.update_target_every = 1000
+        self.learn_step_counter = 0
+
+    def select_action(self, state):
+        if random.random() < self.epsilon:
+            return random.randint(0, self.action_dim - 1)
+        else:
+            with torch.no_grad():
+                state = torch.FloatTensor(state).unsqueeze(0)
+                q_values = self.policy_net(state)
+                return q_values.argmax().item()
+
+    def optimize_model(self):
+        if len(self.replay_buffer) < self.batch_size:
+            return
+        
+        state, action, reward, next_state, done = self.replay_buffer.sample(self.batch_size)
+        state = torch.FloatTensor(state)
+        action = torch.LongTensor(action)
+        reward = torch.FloatTensor(reward)
+        next_state = torch.FloatTensor(next_state)
+        done = torch.FloatTensor(done)
+
+        q_values = self.policy_net(state).gather(1, action.unsqueeze(1)).squeeze(1)
+        next_q_values = self.target_net(next_state).max(1)[0]
+        expected_q_values = reward + (1 - done) * self.gamma * next_q_values
+
+        loss = self.policy_net.criterion(q_values, expected_q_values)
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        
+        self.learn_step_counter += 1
+        if self.learn_step_counter % self.update_target_every == 0:
+            self.target_net.load_state_dict(self.policy_net.state_dict())
+
+    def store_transition(self, transition):
+        self.replay_buffer.push(transition)
+
+
+
+
+
+
+# Define the MLP model
+class MLP(nn.Module):
+    def __init__(self, input_dim, output_dim):
+        super(MLP, self).__init__()
+        self.fc1 = nn.Linear(input_dim, 128)
+        self.fc2 = nn.Linear(128, 128)
+        self.fc3 = nn.Linear(128, output_dim)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
+
+# Define the DDPG model
+class DDPG:
+    def __init__(self, state_dim, action_dim):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.actor = MLP(state_dim, action_dim)
+        self.critic = MLP(state_dim + action_dim, 1)
+        self.actor_target = MLP(state_dim, action_dim)
+        self.critic_target = MLP(state_dim + action_dim, 1)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.critic_target.load_state_dict(self.critic.state_dict())
+        self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=0.001)
+        self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=0.001)
+        self.memory = deque(maxlen=10000)  # Experience replay buffer
+        self.batch_size = 128
+
+    def update(self):
+        if len(self.memory) < self.batch_size:
+            return
+
+        batch = random.sample(self.memory, self.batch_size)
+        states, actions, rewards, next_states = zip(*batch)
+
+        states = convert_list_to_tensor(states)
+        actions = convert_list_to_tensor(actions)
+        rewards = convert_list_to_tensor(rewards)
+        next_states = convert_list_to_tensor(next_states)
+
+        # Ensure actions have the correct shape
+        if actions.ndimension() == 1:
+            actions = actions.unsqueeze(1)  # Reshape to [batch_size, action_dim]
+
+        # Print shapes for debugging
+       # print(f"States shape: {states.shape}")
+       # print(f"Actions shape: {actions.shape}")
+
+        assert states.shape[1] == self.state_dim, f"Expected states dimension: {self.state_dim}, got: {states.shape[1]}"
+        assert actions.shape[1] == self.action_dim, f"Expected actions dimension: {self.action_dim}, got: {actions.shape[1]}"
+
+        # Critic update
+        with torch.no_grad():
+            target_actions = self.actor_target(next_states)
+            target_q = rewards + 0.99 * self.critic_target(torch.cat([next_states, target_actions], dim=1))
+
+        current_q = self.critic(torch.cat([states, actions], dim=1))
+        critic_loss = nn.MSELoss()(current_q, target_q)
+        self.critic_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic_optimizer.step()
+
+        # Actor update
+        actor_loss = -self.critic(torch.cat([states, self.actor(states)], dim=1)).mean()
+        self.actor_optimizer.zero_grad()
+        actor_loss.backward()
+        self.actor_optimizer.step()
+
+        # Soft update of target networks
+        for target_param, param in zip(self.actor_target.parameters(), self.actor.parameters()):
+            target_param.data.copy_(0.995 * target_param.data + 0.005 * param.data)
+
+        for target_param, param in zip(self.critic_target.parameters(), self.critic.parameters()):
+            target_param.data.copy_(0.995 * target_param.data + 0.005 * param.data)
+
+
+    def remember(self, state, action, reward, next_state):
+         self.memory.append((state, action, reward, next_state))
+
+
+
+# Define the Federated Learning Server for DDPG
+class FederatedLearningServerDDPG:
+    def __init__(self, model, num_agents):
+        self.global_model = model
+        self.num_agents = num_agents
+        self.global_rewards = [0.001]  # To store global rewards
+    def aggregate_weights(self, local_weights_list):
+        """
+        Aggregate weights from multiple local models using simple averaging.
+
+        Args:
+            local_weights_list (list of dict): List containing the state_dict of each local model.
+
+        Returns:
+            dict: Aggregated weights.
+        """
+        # Ensure there is at least one set of weights
+        if not local_weights_list:
+            raise ValueError("No local weights provided for aggregation.")
+
+        # Initialize a dictionary to hold the aggregated weights
+        aggregated_weights = {}
+        for key in local_weights_list[0].keys():
+            # Average the weights for each key
+            aggregated_weights[key] = sum(local_weights[key] for local_weights in local_weights_list) / len(local_weights_list)
+
+        return aggregated_weights
+
+    def generate_data(num_entries, state_dim, action_dim):
+      return [
+          (
+              [np.random.rand(state_dim)],               # state
+              np.random.randint(action_dim),             # action
+              np.random.rand(),                          # reward
+              [np.random.rand(state_dim)],               # next_state
+              np.random.rand(),                          # log_prob
+              None                                       # extra
+          ) for _ in range(num_entries)
+      ]
+    def broadcast_weights(self):
+        return self.global_model.actor.state_dict()
+
+    def update_global_model(self, local_weights):
+        """
+        Update the global model with aggregated weights from local models.
+
+        Args:
+            local_weights (list of dict): List of state_dicts from local models.
+        """
+        new_weights = self.aggregate_weights(local_weights)
+        self.global_model.actor.load_state_dict(new_weights)
+    def record_global_reward(self, reward):
+        self.global_rewards.append(reward)
+
+# Define the Federated Learning Agent for DDPG
+class FederatedLearningAgentDDPG:
+    def __init__(self, model, agent_id):
+        self.local_model = model
+        self.local_rewards = []  # To store local rewards
+        self.agent_id = agent_id  # Add agent_id for data indexing
+
+    def train_local_model(self, data):
+        rewards = [0.0001]
+        for episode_data in data:
+            if isinstance(episode_data, tuple) and len(episode_data) in [5, 6]:
+                if len(episode_data) == 6:
+                    state, action, reward, next_state, log_prob, extra = episode_data
+                else:
+                    state, action, reward, next_state, log_prob = episode_data
+                    extra = None
+            else:
+                #print(f"Unexpected data format: {episode_data}")  # Debug print
+                continue  # Skip this entry and move to the next
+
+            # Ensure all components are in expected formats
+            if not (isinstance(state, np.ndarray) and isinstance(next_state, np.ndarray)):
+                print(f"Unexpected state/next_state format: {state}, {next_state}")  # Debug print
+                continue
+
+            self.local_model.remember(state, action, reward, next_state, log_prob, extra)
+            self.local_model.update()
+
+            rewards.append(reward)
+
+        if rewards:
+            return np.mean(rewards)
+        else:
+            return 0  # or some other default value
+
+
+
+
+    def send_model_update(self):
+        return self.local_model.actor.state_dict()
+
+    def record_local_reward(self, reward):
+        self.local_rewards.append(reward)
+
+# Federated training loop for DDPG
+def federated_training_loop_ddpg(server, agents, num_episodes, data):
+    snr_values = [0.1]
+    latency_values = [0.1]
+    rewards_ddpg = []  # To track DDPG rewards
+
+    for episode in range(num_episodes):
+        local_weights = []
+        global_rewards = [0.001]
+
+        # Simulate SNR and latency
+        snr = simulate_snr(episode)
+        latency = simulate_latency(episode)
+        snr_values.append(snr)
+        latency_values.append(latency)
+
+        for agent in agents:
+            agent_id = agent.agent_id
+            agent_rewards = []
+
+            # Download global model
+            agent.local_model.actor.load_state_dict(server.broadcast_weights())
+
+            # Train the local model
+            for d in data[agent_id]:
+                reward = agent.train_local_model(d)
+                agent.record_local_reward(reward)
+                agent_rewards.append(reward)
+
+            # Collect local model weights
+            local_weights.append(agent.send_model_update())
+
+            # Average local reward for this agent
+            avg_local_reward = np.mean(agent_rewards)
+            global_rewards.append(avg_local_reward)
+
+        # Update global model
+        server.update_global_model(local_weights)
+
+        # Average global reward for this episode
+        avg_global_reward = np.mean(global_rewards)
+        server.record_global_reward(avg_global_reward)
+        rewards_ddpg.append(avg_global_reward)  # Track rewards for DDPG
+        print(f"DDPG Episode {episode + 1}/{num_episodes} - Global Avg Reward: {avg_global_reward}")
+
+    return snr_values, latency_values, rewards_ddpg
+
+# Define the Policy Network
+class PolicyNetwork(nn.Module):
+    def __init__(self, state_dim, action_dim):
+        super(PolicyNetwork, self).__init__()
+        self.fc1 = nn.ReLU(state_dim, 128)
+        self.fc2 = nn.ReLU(128, 128)
+        self.fc3 =nn.Linear(128, action_dim)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return torch.tanh(self.fc3(x))
+
+# Define the Value Network
+class ValueNetwork(nn.Module):
+    def __init__(self, state_dim):
+        super(ValueNetwork, self).__init__()
+        self.fc1 =nn.ReLU(state_dim, 128)
+        self.fc2 = nn.ReLU(128, 128)
+        self.fc3 = nn.Linear(128, 1)
+
+    def forward(self, x):
+        x = torch.relu(self.fc1(x))
+        x = torch.relu(self.fc2(x))
+        return self.fc3(x)
+
+# Define the PPO model
+
+
+# Define PPO Model
+class PPO:
+    def __init__(self, state_dim, action_dim):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.policy = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, action_dim),
+            nn.Softmax(dim=-1)
+        )
+        self.value = nn.Sequential(
+            nn.Linear(state_dim, 128),
+            nn.ReLU(),
+            nn.Linear(128, 1)
+        )
+        self.policy_optimizer = optim.Adam(self.policy.parameters(), lr=0.001)
+        self.value_optimizer = optim.Adam(self.value.parameters(), lr=0.001)
+        self.memory = []
+
+    def update(self):
+        if len(self.memory) == 0:
+            return
+
+        batch = self.memory
+        states, actions, rewards, next_states, log_probs = zip(*batch)
+
+        states = torch.tensor(states, dtype=torch.float32)
+        actions = torch.tensor(actions, dtype=torch.long)
+        rewards = torch.tensor(rewards, dtype=torch.float32)
+        next_states = torch.tensor(next_states, dtype=torch.float32)
+        log_probs = torch.tensor(log_probs, dtype=torch.float32)
+
+        # Compute value and advantage
+        values = self.value(states).squeeze()
+        next_values = self.value(next_states).squeeze()
+        advantages = rewards + 0.99 * next_values - values
+
+        # Compute policy loss
+        new_log_probs = self.policy(states).gather(1, actions.unsqueeze(1)).squeeze()
+        ratio = torch.exp(new_log_probs - log_probs)
+        policy_loss = -torch.mean(ratio * advantages)
+
+        # Update policy
+        self.policy_optimizer.zero_grad()
+        policy_loss.backward(retain_graph=False)  # No need to retain graph unless necessary
+        self.policy_optimizer.step()
+
+        # Compute value loss
+        value_loss = nn.MSELoss()(values, rewards + 0.99 * next_values)
+
+        # Update value network
+        self.value_optimizer.zero_grad()
+        value_loss.backward(retain_graph=False)  # Same here
+        self.value_optimizer.step()
+
+    def  remember(self, state, action, reward, next_state, log_prob, extra):
+        self.memory.append((state, action, reward, next_state, log_prob, extra))
+        self.memory = []
+
+
+# Define the Federated Learning Server for PPO
+class FederatedLearningServerPPO:
+    def __init__(self, model, num_agents):
+        self.global_model = model
+        self.num_agents = num_agents
+        self.global_rewards = [0.001]
+
+    def aggregate_weights(self, local_weights):
+        new_weights = {}
+        for key in local_weights[0].keys():
+            tensors = [local_weights[i][key] for i in range(self.num_agents)]
+            tensors = [torch.tensor(tensor, dtype=torch.float32) if isinstance(tensor, np.ndarray) else tensor for tensor in tensors]
+            new_weights[key] = torch.mean(torch.stack(tensors), dim=0)
+        return new_weights
+
+    def broadcast_weights(self):
+        return self.global_model.policy.state_dict()
+
+    def update_global_model(self, local_weights):
+        new_weights = self.aggregate_weights(local_weights)
+        self.global_model.policy.load_state_dict(new_weights)
+
+    def record_global_reward(self, reward):
+        self.global_rewards.append(reward)
+
+# Define the Federated Learning Agent for PPO
+class FederatedLearningAgentPPO:
+    def __init__(self, model, agent_id, env):
+        self.local_model = model
+        self.local_rewards = []
+        self.agent_id = agent_id
+        self.env = env
+
+    def train_local_model(self, data):
+        rewards = []
+        for episode_data in data:
+           # print(f"Data entry length: {len(episode_data)}")  # Debug print
+           # print(f"Data entry content: {episode_data}")  # Debug print
+
+            if len(episode_data) == 5:
+                state, action, reward, next_state, log_prob = episode_data
+                extra = None
+            elif len(episode_data) == 6:
+                state, action, reward, next_state, log_prob, extra = episode_data
+            else:
+                raise ValueError("Unexpected data format")
+
+            self.local_model.remember(state, action, reward, next_state, log_prob, extra)
+            self.local_model.update()
+
+            rewards.append(reward)
+        return np.mean(rewards)
+
+
+
+    def send_model_update(self):
+        return self.local_model.policy.state_dict()
+
+    def record_local_reward(self, reward):
+        self.local_rewards.append(reward)
+
+# Federated training loop for PPO
+def federated_training_loop_ppo(server, agents, num_episodes_per_agent, num_episodes, state_dim, action_dim):
+    snr_values = []
+    latency_values = []
+    rewards_ppo = []
+
+    for episode in range(num_episodes):
+        local_weights = []
+        global_rewards = []  # Initialize here
+        snr = simulate_snr(episode)
+        latency = simulate_latency(episode)
+        snr_values.append(snr)
+        latency_values.append(latency)
+
+        for agent in agents:
+            agent_rewards = []
+            agent_data = [([np.random.rand(state_dim)], np.random.randint(action_dim), np.random.rand(), [np.random.rand(state_dim)], np.random.rand(), None) for _ in range(num_episodes_per_agent)]
+
+            # Download global model
+            agent.local_model.policy.load_state_dict(server.broadcast_weights())
+
+            # Train the local model
+            avg_reward = agent.train_local_model(agent_data)
+            agent.record_local_reward(avg_reward)
+            global_rewards.append(avg_reward)  # Append to global_rewards
+
+            # Collect local model weights
+            local_weights.append(agent.send_model_update())
+
+        # Update global model
+        server.update_global_model(local_weights)
+
+        # Average global reward for this episode
+        avg_global_reward = np.mean(global_rewards)
+        server.record_global_reward(avg_global_reward)
+        rewards_ppo.append(avg_global_reward)
+        #print(f"PPO Episode {episode + 1}/{num_episodes} - Global Avg Reward: {avg_global_reward}")
+
+    return snr_values, latency_values, rewards_ppo
+# Training Functions
+def train_ddqn(env, agent, num_episodes, state_dim, action_dim):
+    snr_values, latency_values, rewards = [], [], []
+    for episode in range(num_episodes):
+        state = env.reset()
+        total_reward = 0
+        done = False
+        while not done:
+            action = agent.select_action(state)
+            next_state, reward, done, _ = env.step(action)
+            total_reward += reward
+
+            agent.store_transition((state, action, reward, next_state, done))
+            agent.optimize_model()
+            state = next_state
+
+        rewards.append(total_reward*0.005)
+        snr_values.append(np.random.uniform(10, 30))
+        latency_values.append(np.random.uniform(0.01, 0.1))
+    return snr_values, latency_values, rewards
+
+
+def generate_data(num_entries, state_dim, action_dim):
+    return [
+        (
+            [np.random.rand(state_dim)],               # state
+            np.random.randint(action_dim),             # action
+            np.random.rand(),                          # reward
+            [np.random.rand(state_dim)],               # next_state
+            np.random.rand(),                          # log_prob
+            None                                       # extra
+        ) for _ in range(num_entries)
+    ]
+
+
+
+
+
+
+# Simulate SNR
+def simulate_snr(episode):
+    return np.sin(episode / 10) * 10 + 30
+
+# Simulate Latency
+def simulate_latency(episode):
+    return np.exp(-episode / 100) 
+
+import matplotlib.pyplot as plt
+import os
+import gym
+import numpy as np
+
+
+def main():
+    # CartPole environment setup
+    env_name = 'CartPole-v1'
+    env = gym.make(env_name)
+    state_dim = env.observation_space.shape[0]
+    action_dim = env.action_space.n
+    num_agents = 3
+    num_episodes = 1000
+    num_episodes_per_agent = 1
+    
+    # Initialize DDQN
+    ddqn_agent = DDQNAgent(state_dim, action_dim)
+    ddqn_snr, ddqn_latency, ddqn_rewards = train_ddqn(env, ddqn_agent, num_episodes, state_dim, action_dim)
+
+    # Initialize PPO
+    ppo_model = PPO(state_dim, action_dim)
+    ppo_server = FederatedLearningServerPPO(ppo_model, num_agents)
+    ppo_agents = [FederatedLearningAgentPPO(PPO(state_dim, action_dim), i, env) for i in range(num_agents)]
+
+    # Initialize DDPG
+    ddpg_model = DDPG(state_dim, action_dim)
+    ddpg_server = FederatedLearningServerDDPG(ddpg_model, num_agents)
+    ddpg_agents = [FederatedLearningAgentDDPG(DDPG(state_dim, action_dim), i) for i in range(num_agents)]
+
+    # Generate data for DDPG
+    data = {i: generate_data(num_episodes_per_agent, state_dim, action_dim) for i in range(num_agents)}
+
+    # Run federated training for PPO
+    ppo_snr, ppo_latency, ppo_rewards = federated_training_loop_ppo(ppo_server, ppo_agents, num_episodes_per_agent, num_episodes, state_dim, action_dim)
+    
+    # Run federated training for DDPG
+    ddpg_snr, ddpg_latency, ddpg_rewards = federated_training_loop_ddpg(ddpg_server, ddpg_agents, num_episodes, data)
+    
+    # Plot SNR results
+    plt.figure(figsize=(6, 6))
+    # Different markers for Latency as well
+    plt.plot(ppo_latency, label='L2FPPO', color='b', linestyle='-', marker='D', markersize=10)
+    plt.plot(ddpg_latency, label='FLDDPG', color='g', linestyle='-.', marker='*', markersize=6)
+    plt.plot(ddqn_latency, label='DDQN', color='r', linestyle='--', marker='s', markersize=6)
+    plt.xlabel('Federation Window', fontsize=26)
+    plt.ylabel('Latency (ms)', fontsize=26)
+    plt.legend(prop={'size': 26})
+    #plt.title('Latency Comparison', fontsize=22)
+    
+   
+    plt.savefig('/content/drive/My Drive/FED/FEDDV19.pdf')
+
+    #print(f"Plot successfully saved to {plot_path}")
+    plt.show()
+
+if __name__ == "__main__":
+    main()
